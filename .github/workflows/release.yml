@@ -41,6 +41,8 @@ permissions:
 on:
   pull_request:
   push:
+    branches:
+      - main
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
@@ -379,6 +381,68 @@ jobs:
           else
             echo "No Homebrew formula commits to push"
           fi
+
+  # Build native Android executables without changing the existing release workflow.
+  build-android:
+    name: Android (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            linker: aarch64-linux-android21-clang
+            machine: AArch64
+          - target: x86_64-linux-android
+            linker: x86_64-linux-android21-clang
+            machine: Advanced Micro Devices X86-64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Android NDK
+        uses: android-actions/setup-android@v3
+      - name: Configure Android linker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "ndk;27.2.12479018"
+          ndk_home="$ANDROID_HOME/ndk/27.2.12479018"
+          toolchain="$ndk_home/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          target_upper="$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')"
+          target_lower="$(echo "${{ matrix.target }}" | tr '-' '_')"
+          echo "CARGO_TARGET_${target_upper}_LINKER=$toolchain/${{ matrix.linker }}" >> "$GITHUB_ENV"
+          echo "CC_${target_lower}=$toolchain/${{ matrix.linker }}" >> "$GITHUB_ENV"
+          echo "AR_${target_lower}=$toolchain/llvm-ar" >> "$GITHUB_ENV"
+      - name: Build release executable
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Verify Android ELF architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/lazygitrs"
+          readelf -h "$binary"
+          readelf -h "$binary" | grep -F "Machine:" | grep -F "${{ matrix.machine }}"
+          test -x "$binary"
+      - name: Smoke-test executable on Android emulator
+        if: matrix.target == 'x86_64-linux-android'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          script: |
+            adb push target/x86_64-linux-android/release/lazygitrs /data/local/tmp/lazygitrs
+            adb shell chmod 755 /data/local/tmp/lazygitrs
+            adb shell /data/local/tmp/lazygitrs --version
+      - name: Upload Android executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: lazygitrs-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/lazygitrs
+          if-no-files-found: error
 
   announce:
     needs:
