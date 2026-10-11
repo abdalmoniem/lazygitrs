@@ -1,6 +1,9 @@
 default:
     just --list
 
+build-android:
+    @CFLAGS_aarch64_linux_android="--target=aarch64-linux-android24 -I$TERMUX__PREFIX/include" cargo build --release
+
 ref-pull:
     bun scripts/fetch-references.ts pull
 

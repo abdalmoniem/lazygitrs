@@ -39,8 +39,11 @@ permissions:
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
 on:
+  workflow_dispatch:
   pull_request:
   push:
+    branches:
+      - main
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
@@ -50,9 +53,9 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
-      publishing: ${{ !github.event.pull_request }}
+      tag: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+      tag-flag: ${{ startsWith(github.ref, 'refs/tags/') && format('--tag={0}', github.ref_name) || '' }}
+      publishing: ${{ startsWith(github.ref, 'refs/tags/') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -62,7 +65,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
       - name: Require release tags to be on main
-        if: ${{ !github.event.pull_request }}
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -89,7 +92,7 @@ jobs:
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          dist ${{ (startsWith(github.ref, 'refs/tags/') && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -379,6 +382,86 @@ jobs:
           else
             echo "No Homebrew formula commits to push"
           fi
+
+  # Build native Android executables without changing the existing release workflow.
+  build-android:
+    name: Android (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            linker: aarch64-linux-android21-clang
+            machine: AArch64
+          - target: x86_64-linux-android
+            linker: x86_64-linux-android21-clang
+            machine: Advanced Micro Devices X86-64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          sdkmanager="$(find "$sdk_root" -type f -name sdkmanager -perm -u+x -print -quit)"
+          if [[ -z "$sdkmanager" ]]; then
+            echo "sdkmanager not found under $sdk_root"
+            exit 1
+          fi
+          echo "$(dirname "$sdkmanager")" >> "$GITHUB_PATH"
+          echo "ANDROID_HOME=$sdk_root" >> "$GITHUB_ENV"
+          set +o pipefail
+          yes | "$sdkmanager" --licenses >/dev/null
+          license_status=${PIPESTATUS[1]}
+          set -o pipefail
+          if [[ "$license_status" -ne 0 ]]; then
+            echo "Android SDK license acceptance failed with exit code $license_status"
+            exit "$license_status"
+          fi
+          "$sdkmanager" "ndk;27.2.12479018"
+      - name: Configure Android linker
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk_home="$ANDROID_HOME/ndk/27.2.12479018"
+          toolchain="$ndk_home/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          target_upper="$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')"
+          target_lower="$(echo "${{ matrix.target }}" | tr '-' '_')"
+          echo "CARGO_TARGET_${target_upper}_LINKER=$toolchain/${{ matrix.linker }}" >> "$GITHUB_ENV"
+          echo "CC_${target_lower}=$toolchain/${{ matrix.linker }}" >> "$GITHUB_ENV"
+          echo "AR_${target_lower}=$toolchain/llvm-ar" >> "$GITHUB_ENV"
+      - name: Build release executable
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Verify Android ELF architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/lazygitrs"
+          readelf -h "$binary"
+          readelf -h "$binary" | grep -F "Machine:" | grep -F "${{ matrix.machine }}"
+          test -x "$binary"
+      - name: Smoke-test executable on Android emulator
+        if: matrix.target == 'x86_64-linux-android'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          script: |
+            adb push target/x86_64-linux-android/release/lazygitrs /data/local/tmp/lazygitrs
+            adb shell chmod 755 /data/local/tmp/lazygitrs
+            adb shell /data/local/tmp/lazygitrs --version
+      - name: Upload Android executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: lazygitrs-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/lazygitrs
+          if-no-files-found: error
 
   announce:
     needs:
